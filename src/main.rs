@@ -30,6 +30,8 @@ struct Message {
 
 struct Config {
     model: String,
+    provider: String,
+    ollama_url: String,
     python: String,
     bridge: PathBuf,
     temperature: f32,
@@ -40,7 +42,7 @@ struct Config {
 }
 
 fn main() {
-    let config = match parse_args() {
+    let mut config = match parse_args() {
         Ok(config) => config,
         Err(message) => {
             eprintln!("{message}");
@@ -77,10 +79,10 @@ fn main() {
         return;
     }
 
-    chat_loop(&config);
+    chat_loop(&mut config);
 }
 
-fn chat_loop(config: &Config) {
+fn chat_loop(config: &mut Config) {
     let mut history: Vec<Message> = Vec::new();
     let stdin = io::stdin();
 
@@ -103,25 +105,97 @@ fn chat_loop(config: &Config) {
             continue;
         }
 
-        match input {
-            "/exit" | "/quit" => break,
-            "/clear" => {
-                history.clear();
-                print!("\x1b[2J\x1b[H");
-                if !config.plain {
-                    print_banner(config);
+        if input.starts_with('/') {
+            let parts: Vec<&str> = input.split_whitespace().collect();
+            match parts[0] {
+                "/exit" | "/quit" => break,
+                "/clear" => {
+                    history.clear();
+                    print!("\x1b[2J\x1b[H");
+                    if !config.plain {
+                        print_banner(config);
+                    }
+                    continue;
                 }
-                continue;
+                "/models" => {
+                    match fetch_models(config) {
+                        Ok(models) => {
+                            if models.is_empty() {
+                                print_notice(config, "no models found or provider unreachable");
+                            } else {
+                                println!("{}", paint(config, "╭─ Available Models ──────────────────────────╮", "\x1b[38;5;141m"));
+                                for model_name in models {
+                                    let indicator = if model_name == config.model {
+                                        paint(config, "●", "\x1b[38;5;220m")
+                                    } else {
+                                        " ".to_string()
+                                    };
+                                    println!("{} {} {}", paint(config, "│", "\x1b[38;5;141m"), indicator, model_name);
+                                }
+                                println!("{}", paint(config, "╰────────────────────────────────────────────╯", "\x1b[38;5;141m"));
+                                print_notice(config, "use '/model <name>' to switch");
+                            }
+                        }
+                        Err(err) => print_error(config, &err),
+                    }
+                    continue;
+                }
+                "/help" => {
+                    print_chat_help(config);
+                    continue;
+                }
+                "/model" => {
+                    if parts.len() > 1 {
+                        let mut new_model = parts[1..].join(" ");
+                        if new_model.starts_with("ollama:") {
+                            config.provider = "ollama".to_string();
+                            new_model = new_model.trim_start_matches("ollama:").to_string();
+                            print_notice(config, "provider switched to: ollama");
+                        } else if config.provider == "ollama" && !new_model.contains(':') {
+                            // If user is in ollama and types a model without prefix, 
+                            // we stay in ollama. If they want google, they should switch provider.
+                        }
+                        config.model = new_model;
+                        print_notice(config, &format!("model switched to: {}", config.model));
+                    } else {
+                        print_notice(config, &format!("current model: {} (provider: {})", config.model, config.provider));
+                    }
+                    continue;
+                }
+                "/provider" => {
+                    if parts.len() > 1 {
+                        let new_provider = parts[1].to_lowercase();
+                        if new_provider == "google" || new_provider == "ollama" {
+                            config.provider = new_provider;
+                            print_notice(config, &format!("provider switched to: {}", config.provider));
+                        } else {
+                            print_error(config, "unknown provider. use 'google' or 'ollama'");
+                        }
+                    } else {
+                        print_notice(config, &format!("current provider: {}", config.provider));
+                    }
+                    continue;
+                }
+                "/providers" => {
+                    println!("{}", paint(config, "╭─ Supported Providers ───────────────────────╮", "\x1b[38;5;141m"));
+                    let providers = ["google", "ollama"];
+                    for p in providers {
+                        let indicator = if p == config.provider {
+                            paint(config, "●", "\x1b[38;5;82m")
+                        } else {
+                            " ".to_string()
+                        };
+                        println!("{} {} {}", paint(config, "│", "\x1b[38;5;141m"), indicator, p);
+                    }
+                    println!("{}", paint(config, "╰────────────────────────────────────────────╯", "\x1b[38;5;141m"));
+                    print_notice(config, "use '/provider <name>' to switch");
+                    continue;
+                }
+                _ => {
+                    print_error(config, &format!("unknown command: '{}'. type /help for commands", parts[0]));
+                    continue;
+                }
             }
-            "/help" => {
-                print_chat_help(config);
-                continue;
-            }
-            "/model" => {
-                print_notice(config, &format!("model: {}", config.model));
-                continue;
-            }
-            _ => {}
         }
 
         history.push(Message {
@@ -264,10 +338,84 @@ fn ask_model(config: &Config, history: &[Message]) -> Result<String, String> {
     Ok(answer)
 }
 
+fn fetch_models(config: &Config) -> Result<Vec<String>, String> {
+    let mut payload = String::new();
+    payload.push('{');
+    write!(payload, "\"action\":\"list_models\"").unwrap();
+    write!(payload, ",\"provider\":{}", json_string(&config.provider)).unwrap();
+    write!(payload, ",\"ollama_url\":{}", json_string(&config.ollama_url)).unwrap();
+    payload.push('}');
+
+    let mut child = Command::new(&config.python)
+        .arg(&config.bridge)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to start bridge: {err}"))?;
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(payload.as_bytes()).unwrap();
+    drop(stdin);
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    let bytes = reader.read_line(&mut line).map_err(|err| format!("read error: {err}"))?;
+
+    if bytes == 0 {
+        let mut stderr = String::new();
+        if let Some(mut child_stderr) = child.stderr.take() {
+            let _ = child_stderr.read_to_string(&mut stderr);
+        }
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            "Python bridge closed without output".to_string()
+        } else {
+            detail.to_string()
+        });
+    }
+
+    // Check for error emitted by the bridge
+    if line.contains("\"type\":\"error\"") {
+        if let Some(msg) = json_field(&line, "message") {
+            return Err(msg);
+        }
+    }
+
+    // Look for models array
+    if let Some(start) = line.find("\"models\"") {
+        let rest = &line[start + 8..];
+        if let Some(colon_pos) = rest.find(':') {
+            let rest = &rest[colon_pos + 1..];
+            if let Some(bracket_start) = rest.find('[') {
+                let rest = &rest[bracket_start + 1..];
+                if let Some(bracket_end) = rest.find(']') {
+                    let list = &rest[..bracket_end];
+                    let mut models = Vec::new();
+                    for item in list.split(',') {
+                        let trimmed = item.trim().trim_matches('"');
+                        if !trimmed.is_empty() {
+                            models.push(trimmed.to_string());
+                        }
+                    }
+                    if !models.is_empty() {
+                        return Ok(models);
+                    }
+                }
+            }
+        }
+    }
+
+    Err("no models found in bridge response".to_string())
+}
+
 fn build_payload(config: &Config, history: &[Message]) -> String {
     let mut out = String::new();
     out.push('{');
     write!(out, "\"model\":{}", json_string(&config.model)).unwrap();
+    write!(out, ",\"provider\":{}", json_string(&config.provider)).unwrap();
+    write!(out, ",\"ollama_url\":{}", json_string(&config.ollama_url)).unwrap();
     write!(out, ",\"temperature\":{}", config.temperature).unwrap();
     write!(out, ",\"thinking\":{}", config.thinking).unwrap();
     out.push_str(",\"messages\":[");
@@ -286,6 +434,8 @@ fn build_payload(config: &Config, history: &[Message]) -> String {
 
 fn parse_args() -> Result<Config, String> {
     let mut model = env::var("GEMMA_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let mut provider = "google".to_string();
+    let mut ollama_url = env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".to_string());
     let mut python = env::var("PYTHON").unwrap_or_else(|_| "python3".to_string());
     let mut bridge = PathBuf::from(DEFAULT_BRIDGE);
     let mut temperature = 0.7_f32;
@@ -303,6 +453,27 @@ fn parse_args() -> Result<Config, String> {
                 model = args
                     .get(index)
                     .ok_or_else(|| "--model needs a value".to_string())?
+                    .to_string();
+                if model.starts_with("ollama:") {
+                    provider = "ollama".to_string();
+                    model = model.trim_start_matches("ollama:").to_string();
+                }
+            }
+            "--provider" => {
+                index += 1;
+                provider = args
+                    .get(index)
+                    .ok_or_else(|| "--provider needs a value (google/ollama)".to_string())?
+                    .to_lowercase();
+            }
+            "--ollama" => {
+                provider = "ollama".to_string();
+            }
+            "--ollama-url" => {
+                index += 1;
+                ollama_url = args
+                    .get(index)
+                    .ok_or_else(|| "--ollama-url needs a value".to_string())?
                     .to_string();
             }
             "--python" => {
@@ -349,6 +520,8 @@ fn parse_args() -> Result<Config, String> {
 
     Ok(Config {
         model,
+        provider,
+        ollama_url,
         python,
         bridge,
         temperature,
@@ -371,26 +544,33 @@ fn print_banner(config: &Config) {
     println!(
         "{} {}",
         paint(config, "│", "\x1b[38;5;141m"),
-        paint(config, "Google AI Studio streaming chat", "\x1b[1m\x1b[96m")
+        paint(config, "Google AI Studio / Ollama local chat", "\x1b[1m\x1b[96m")
     );
     println!(
-        "{} model      {}",
+        "{} provider    {}",
+        paint(config, "│", "\x1b[38;5;141m"),
+        paint(config, &config.provider, "\x1b[38;5;80m")
+    );
+    println!(
+        "{} model       {}",
         paint(config, "│", "\x1b[38;5;141m"),
         paint(config, &config.model, "\x1b[38;5;220m")
     );
     println!(
-        "{} thinking   {}",
+        "{} thinking    {}",
         paint(config, "│", "\x1b[38;5;141m"),
-        if config.thinking {
+        if config.provider == "ollama" {
+            paint(config, "off (not supported by Ollama)", "\x1b[38;5;245m")
+        } else if config.thinking {
             paint(config, "summaries on", "\x1b[38;5;80m")
         } else {
             paint(config, "off", "\x1b[38;5;245m")
         }
     );
     println!(
-        "{} commands   {}",
+        "{} commands    {}",
         paint(config, "│", "\x1b[38;5;141m"),
-        paint(config, "/help  /model  /clear  /exit", "\x1b[38;5;250m")
+        paint(config, "/help  /models  /providers  /model  /provider  /exit", "\x1b[38;5;250m")
     );
     println!(
         "{}",
@@ -403,14 +583,17 @@ fn print_banner(config: &Config) {
 }
 
 fn print_help() {
-    println!("Gemma Glow - streamed Google AI Studio chat");
+    println!("Gemma Glow - streamed Google AI Studio / Ollama chat");
     println!();
     println!("Usage:");
     println!("  cargo run -- [options]");
     println!("  cargo run -- --prompt \"hello\"");
     println!();
     println!("Options:");
-    println!("  -m, --model <name>          Model name (default: gemma-4-26b-a4b-it)");
+    println!("  -m, --model <name>          Model name (prefix with 'ollama:' for local)");
+    println!("      --provider <name>      Backend provider (google or ollama)");
+    println!("      --ollama               Force Ollama provider");
+    println!("      --ollama-url <url>     Ollama API URL (default: http://localhost:11434)");
     println!("  -p, --prompt <text>         Run a single prompt and exit");
     println!("  -t, --temperature <number>  Sampling temperature (default: 0.7)");
     println!("      --no-thinking          Do not request thought summaries");
@@ -426,10 +609,13 @@ fn print_chat_help(config: &Config) {
         "{}",
         paint(config, "╭─ Commands ─────────────────────────────────╮", "\x1b[38;5;141m")
     );
-    println!("{} /help   show commands", paint(config, "│", "\x1b[38;5;141m"));
-    println!("{} /model  show current model", paint(config, "│", "\x1b[38;5;141m"));
-    println!("{} /clear  clear chat memory", paint(config, "│", "\x1b[38;5;141m"));
-    println!("{} /exit   quit", paint(config, "│", "\x1b[38;5;141m"));
+    println!("{} /help              show commands", paint(config, "│", "\x1b[38;5;141m"));
+    println!("{} /models            list available models", paint(config, "│", "\x1b[38;5;141m"));
+    println!("{} /providers         list supported providers", paint(config, "│", "\x1b[38;5;141m"));
+    println!("{} /provider [name]   show/switch provider", paint(config, "│", "\x1b[38;5;141m"));
+    println!("{} /model [name]      show/switch model", paint(config, "│", "\x1b[38;5;141m"));
+    println!("{} /clear             clear chat memory", paint(config, "│", "\x1b[38;5;141m"));
+    println!("{} /exit              quit", paint(config, "│", "\x1b[38;5;141m"));
     println!(
         "{}",
         paint(config, "╰────────────────────────────────────────────╯", "\x1b[38;5;141m")

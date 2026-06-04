@@ -1,6 +1,6 @@
 # Gemma Glow
 
-Beautiful Rust CLI for chatting with Google AI Studio models, with a tiny Python streaming bridge.
+Beautiful Rust CLI for chatting with Google AI Studio and Ollama models, with a tiny Python streaming bridge.
 
 The default model is:
 
@@ -23,6 +23,13 @@ Edit `.env` and set:
 GEMINI_API_KEY=your_google_ai_studio_api_key_here
 ```
 
+### Ollama Setup (Optional)
+
+To use local models via [Ollama](https://ollama.com/):
+
+1.  Install and run Ollama.
+2.  (Optional) Set `OLLAMA_BASE_URL` in your `.env` if it's not the default `http://localhost:11434`.
+
 No Python package install is required. The bridge uses Python's standard library.
 
 ## Run
@@ -31,6 +38,14 @@ Interactive chat:
 
 ```bash
 cargo run
+```
+
+Run with Ollama:
+
+```bash
+cargo run -- --ollama --model llama3
+# OR use the prefix shortcut:
+cargo run -- -m ollama:llama3
 ```
 
 Single prompt:
@@ -45,10 +60,10 @@ Preview the terminal renderer without calling the API:
 cargo run -- --demo
 ```
 
-Use another model:
+Use another Google model:
 
 ```bash
-cargo run -- --model gemini-2.5-flash
+cargo run -- --model gemini-2.0-flash
 ```
 
 Disable thought summaries if a model rejects them:
@@ -66,14 +81,17 @@ GEMMA_SYSTEM_PROMPT=Reply with concise, polished terminal-friendly answers.
 ## Chat Commands
 
 ```text
-/help   show commands
-/model  show current model
-/clear  clear chat memory
-/exit   quit
+/help              show commands
+/models            list available models for the current provider
+/provider [name]   show or switch provider (google|ollama)
+/model [name]      show or switch model
+/clear             clear chat memory
+/exit              quit
 ```
 
 ## Notes
 
-Google's Gemini API exposes streaming through `streamGenerateContent?alt=sse`. Thought summaries are requested with `generationConfig.thinkingConfig.includeThoughts`.
+- **Google:** Uses `streamGenerateContent?alt=sse`. Thought summaries are requested with `generationConfig.thinkingConfig.includeThoughts`.
+- **Ollama:** Uses the `/api/chat` endpoint. Note that Ollama does not currently support the "thinking" metadata stream in the same way as Google.
 
 If `gemma-4-26b-a4b-it` is not available on your API key, set `GEMMA_MODEL` in `.env` or pass `--model`.

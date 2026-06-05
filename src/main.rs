@@ -4,6 +4,14 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::{Hinter, HistoryHinter};
+use rustyline::validate::{Validator, ValidationContext, ValidationResult};
+use rustyline::{CompletionType, Config as RLConfig, Context, Editor, Helper};
+use rustyline::completion::Completer;
+use std::borrow::Cow;
+
 const DEFAULT_MODEL: &str = "gemma-4-26b-a4b-it";
 const DEFAULT_BRIDGE: &str = "scripts/gemma_stream.py";
 
@@ -39,6 +47,83 @@ struct Config {
     plain: bool,
     demo: bool,
     prompt: Option<String>,
+}
+
+#[derive(Helper)]
+struct RLHelper {
+    completer: RLCompleter,
+    hinter: HistoryHinter,
+}
+
+impl Completer for RLHelper {
+    type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<String>)> {
+        self.completer.complete(line, pos, ctx)
+    }
+}
+
+impl Hinter for RLHelper {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<String> {
+        self.hinter.hint(line, pos, ctx)
+    }
+}
+
+impl Highlighter for RLHelper {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> Cow<'b, str> {
+        Cow::Owned(prompt.to_string())
+    }
+
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        Cow::Borrowed(line)
+    }
+
+    fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
+        false
+    }
+}
+
+impl Validator for RLHelper {
+    fn validate(&self, _ctx: &mut ValidationContext<'_>) -> rustyline::Result<ValidationResult> {
+        Ok(ValidationResult::Valid(None))
+    }
+}
+
+struct RLCompleter {
+    commands: Vec<String>,
+}
+
+impl Completer for RLCompleter {
+    type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        _pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<String>)> {
+        if line.starts_with('/') {
+            let matches: Vec<String> = self
+                .commands
+                .iter()
+                .filter(|c| c.starts_with(line))
+                .cloned()
+                .collect();
+            return Ok((0, matches));
+        }
+        Ok((0, vec![]))
+    }
 }
 
 fn main() {
@@ -83,141 +168,214 @@ fn main() {
 }
 
 fn chat_loop(config: &mut Config) {
-    let mut history: Vec<Message> = Vec::new();
-    let stdin = io::stdin();
+    let mut history_msgs: Vec<Message> = Vec::new();
+
+    let rl_config = RLConfig::builder()
+        .completion_type(CompletionType::List)
+        .build();
+    
+    let commands = vec![
+        "/exit".into(),
+        "/quit".into(),
+        "/clear".into(),
+        "/help".into(),
+        "/model".into(),
+        "/provider".into(),
+    ];
+
+    let helper = RLHelper {
+        completer: RLCompleter {
+            commands,
+        },
+        hinter: HistoryHinter {},
+    };
+    
+    let mut rl = Editor::with_config(rl_config).expect("failed to init rustyline");
+    rl.set_helper(Some(helper));
+
+    let history_path = env::temp_dir().join(".edge_glow_history");
+    let _ = rl.load_history(&history_path);
 
     loop {
-        print_prompt(config, "you");
-        let _ = io::stdout().flush();
+        let label = "you";
+        let color = "\x1b[1m\x1b[38;5;82m";
+        let prompt = paint(config, &format!("{label} ❯ "), color);
 
-        let mut input = String::new();
-        match stdin.read_line(&mut input) {
-            Ok(0) => break,
-            Ok(_) => {}
+        let readline = rl.readline(&prompt);
+        match readline {
+            Ok(line) => {
+                let input = line.trim();
+                if input.is_empty() {
+                    continue;
+                }
+                let _ = rl.add_history_entry(input);
+
+                if input.starts_with('/') {
+                    let parts: Vec<&str> = input.split_whitespace().collect();
+                    match parts[0] {
+                        "/exit" | "/quit" => break,
+                        "/clear" => {
+                            history_msgs.clear();
+                            print!("\x1b[2J\x1b[H");
+                            if !config.plain {
+                                print_banner(config);
+                            }
+                            continue;
+                        }
+                        "/models" | "/model" => {
+                            if parts.len() > 1 {
+                                let mut new_model = parts[1..].join(" ");
+                                if new_model.starts_with("ollama:") {
+                                    config.provider = "ollama".to_string();
+                                    new_model = new_model.trim_start_matches("ollama:").to_string();
+                                    print_notice(config, "provider switched to: ollama");
+                                }
+                                config.model = new_model;
+                                print_notice(config, &format!("model switched to: {}", config.model));
+                            } else {
+                                list_models(config);
+                            }
+                            continue;
+                        }
+                        "/help" => {
+                            print_chat_help(config);
+                            continue;
+                        }
+                        "/providers" | "/provider" => {
+                            if parts.len() > 1 {
+                                let new_provider = parts[1].to_lowercase();
+                                if new_provider == "google" || new_provider == "ollama" {
+                                    let old_provider = config.provider.clone();
+                                    config.provider = new_provider;
+                                    print_notice(config, &format!("provider switched to: {}", config.provider));
+                                    
+                                    if config.provider != old_provider {
+                                        if config.provider == "ollama" {
+                                            if let Ok(models) = fetch_models(config) {
+                                                let first_installed = models.iter().find(|m| m.ends_with("- installed"));
+                                                if let Some(m) = first_installed {
+                                                    let id = if let Some(sp) = m.find(' ') { &m[..sp] } else { m };
+                                                    config.model = id.to_string();
+                                                    print_notice(config, &format!("auto-selected model: {}", config.model));
+                                                }
+                                            }
+                                        } else if config.provider == "google" {
+                                            config.model = env::var("GEMMA_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+                                            print_notice(config, &format!("reset to default google model: {}", config.model));
+                                        }
+                                    }
+                                } else {
+                                    print_error(config, "unknown provider. use 'google' or 'ollama'");
+                                }
+                            } else {
+                                list_providers(config);
+                            }
+                            continue;
+                        }
+                        _ => {
+                            print_error(config, &format!("unknown command: '{}'. type /help for commands", parts[0]));
+                            continue;
+                        }
+                    }
+                }
+
+                history_msgs.push(Message {
+                    role: "user".to_string(),
+                    content: input.to_string(),
+                });
+
+                match ask_model(config, &history_msgs) {
+                    Ok(answer) => {
+                        if !answer.trim().is_empty() {
+                            history_msgs.push(Message {
+                                role: "model".to_string(),
+                                content: answer,
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        print_error(config, &err);
+                        history_msgs.pop();
+                    }
+                }
+            }
+            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+                break;
+            }
             Err(err) => {
-                eprintln!("input error: {err}");
+                println!("Error: {:?}", err);
                 break;
             }
         }
-
-        let input = input.trim();
-        if input.is_empty() {
-            continue;
-        }
-
-        if input.starts_with('/') {
-            let parts: Vec<&str> = input.split_whitespace().collect();
-            match parts[0] {
-                "/exit" | "/quit" => break,
-                "/clear" => {
-                    history.clear();
-                    print!("\x1b[2J\x1b[H");
-                    if !config.plain {
-                        print_banner(config);
-                    }
-                    continue;
-                }
-                "/models" => {
-                    match fetch_models(config) {
-                        Ok(models) => {
-                            if models.is_empty() {
-                                print_notice(config, "no models found or provider unreachable");
-                            } else {
-                                println!("{}", paint(config, "╭─ Available Models ──────────────────────────╮", "\x1b[38;5;141m"));
-                                for model_name in models {
-                                    let indicator = if model_name == config.model {
-                                        paint(config, "●", "\x1b[38;5;220m")
-                                    } else {
-                                        " ".to_string()
-                                    };
-                                    println!("{} {} {}", paint(config, "│", "\x1b[38;5;141m"), indicator, model_name);
-                                }
-                                println!("{}", paint(config, "╰────────────────────────────────────────────╯", "\x1b[38;5;141m"));
-                                print_notice(config, "use '/model <name>' to switch");
-                            }
-                        }
-                        Err(err) => print_error(config, &err),
-                    }
-                    continue;
-                }
-                "/help" => {
-                    print_chat_help(config);
-                    continue;
-                }
-                "/model" => {
-                    if parts.len() > 1 {
-                        let mut new_model = parts[1..].join(" ");
-                        if new_model.starts_with("ollama:") {
-                            config.provider = "ollama".to_string();
-                            new_model = new_model.trim_start_matches("ollama:").to_string();
-                            print_notice(config, "provider switched to: ollama");
-                        } else if config.provider == "ollama" && !new_model.contains(':') {
-                            // If user is in ollama and types a model without prefix, 
-                            // we stay in ollama. If they want google, they should switch provider.
-                        }
-                        config.model = new_model;
-                        print_notice(config, &format!("model switched to: {}", config.model));
-                    } else {
-                        print_notice(config, &format!("current model: {} (provider: {})", config.model, config.provider));
-                    }
-                    continue;
-                }
-                "/provider" => {
-                    if parts.len() > 1 {
-                        let new_provider = parts[1].to_lowercase();
-                        if new_provider == "google" || new_provider == "ollama" {
-                            config.provider = new_provider;
-                            print_notice(config, &format!("provider switched to: {}", config.provider));
-                        } else {
-                            print_error(config, "unknown provider. use 'google' or 'ollama'");
-                        }
-                    } else {
-                        print_notice(config, &format!("current provider: {}", config.provider));
-                    }
-                    continue;
-                }
-                "/providers" => {
-                    println!("{}", paint(config, "╭─ Supported Providers ───────────────────────╮", "\x1b[38;5;141m"));
-                    let providers = ["google", "ollama"];
-                    for p in providers {
-                        let indicator = if p == config.provider {
-                            paint(config, "●", "\x1b[38;5;82m")
-                        } else {
-                            " ".to_string()
-                        };
-                        println!("{} {} {}", paint(config, "│", "\x1b[38;5;141m"), indicator, p);
-                    }
-                    println!("{}", paint(config, "╰────────────────────────────────────────────╯", "\x1b[38;5;141m"));
-                    print_notice(config, "use '/provider <name>' to switch");
-                    continue;
-                }
-                _ => {
-                    print_error(config, &format!("unknown command: '{}'. type /help for commands", parts[0]));
-                    continue;
-                }
-            }
-        }
-
-        history.push(Message {
-            role: "user".to_string(),
-            content: input.to_string(),
-        });
-
-        match ask_model(config, &history) {
-            Ok(answer) => {
-                if !answer.trim().is_empty() {
-                    history.push(Message {
-                        role: "model".to_string(),
-                        content: answer,
-                    });
-                }
-            }
-            Err(err) => {
-                print_error(config, &err);
-                history.pop();
-            }
-        }
     }
+    let _ = rl.save_history(&history_path);
+}
+
+fn list_models(config: &Config) {
+    match fetch_models(config) {
+        Ok(models) => {
+            if models.is_empty() {
+                print_notice(config, "no models found or provider unreachable");
+            } else {
+                println!("{}", paint(config, "╭─ Available Models ──────────────────────────╮", "\x1b[38;5;141m"));
+                for entry in models {
+                    let mut display_name = entry.clone();
+                    let mut indicator = " ".to_string();
+
+                    if config.provider == "ollama" {
+                        let model_id = if let Some(first_space) = entry.find(' ') {
+                            &entry[..first_space]
+                        } else {
+                            &entry
+                        };
+
+                        let is_current = model_id == config.model 
+                            || format!("{}:latest", model_id) == config.model
+                            || config.model.starts_with(model_id);
+
+                        if is_current {
+                            indicator = paint(config, "●", "\x1b[38;5;220m");
+                            display_name = entry.trim_end_matches("- installed")
+                                               .trim_end_matches("- available")
+                                               .to_string();
+                        } else if entry.ends_with("- installed") {
+                            indicator = paint(config, "●", "\x1b[38;5;39m");
+                            display_name = entry.trim_end_matches("- installed").to_string();
+                        } else if entry.ends_with("- available") {
+                            indicator = " ".to_string();
+                            display_name = entry.trim_end_matches("- available").to_string();
+                        }
+                    } else {
+                        if entry == config.model {
+                            indicator = paint(config, "●", "\x1b[38;5;220m");
+                        }
+                    }
+
+                    println!("{} {} {}", paint(config, "│", "\x1b[38;5;141m"), indicator, display_name);
+                }
+                println!("{}", paint(config, "╰────────────────────────────────────────────╯", "\x1b[38;5;141m"));
+                print_notice(config, &format!("current model: {} (provider: {})", config.model, config.provider));
+                print_notice(config, "use '/model <name>' to switch");
+            }
+        }
+        Err(err) => print_error(config, &err),
+    }
+}
+
+fn list_providers(config: &Config) {
+    println!("{}", paint(config, "╭─ Supported Providers ───────────────────────╮", "\x1b[38;5;141m"));
+    let providers = ["google", "ollama"];
+    for p in providers {
+        let indicator = if p == config.provider {
+            paint(config, "●", "\x1b[38;5;82m")
+        } else {
+            " ".to_string()
+        };
+        println!("{} {} {}", paint(config, "│", "\x1b[38;5;141m"), indicator, p);
+    }
+    println!("{}", paint(config, "╰────────────────────────────────────────────╯", "\x1b[38;5;141m"));
+    print_notice(config, &format!("current provider: {}", config.provider));
+    print_notice(config, "use '/provider <name>' to switch");
 }
 
 fn ask_model(config: &Config, history: &[Message]) -> Result<String, String> {
@@ -360,54 +518,33 @@ fn fetch_models(config: &Config) -> Result<Vec<String>, String> {
 
     let stdout = child.stdout.take().unwrap();
     let mut reader = BufReader::new(stdout);
+    let mut models = Vec::new();
     let mut line = String::new();
-    let bytes = reader.read_line(&mut line).map_err(|err| format!("read error: {err}"))?;
 
-    if bytes == 0 {
-        let mut stderr = String::new();
-        if let Some(mut child_stderr) = child.stderr.take() {
-            let _ = child_stderr.read_to_string(&mut stderr);
-        }
-        let detail = stderr.trim();
-        return Err(if detail.is_empty() {
-            "Python bridge closed without output".to_string()
-        } else {
-            detail.to_string()
-        });
-    }
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line).map_err(|err| format!("read error: {err}"))?;
+        if bytes == 0 { break; }
 
-    // Check for error emitted by the bridge
-    if line.contains("\"type\":\"error\"") {
-        if let Some(msg) = json_field(&line, "message") {
-            return Err(msg);
-        }
-    }
-
-    // Look for models array
-    if let Some(start) = line.find("\"models\"") {
-        let rest = &line[start + 8..];
-        if let Some(colon_pos) = rest.find(':') {
-            let rest = &rest[colon_pos + 1..];
-            if let Some(bracket_start) = rest.find('[') {
-                let rest = &rest[bracket_start + 1..];
-                if let Some(bracket_end) = rest.find(']') {
-                    let list = &rest[..bracket_end];
-                    let mut models = Vec::new();
-                    for item in list.split(',') {
-                        let trimmed = item.trim().trim_matches('"');
-                        if !trimmed.is_empty() {
-                            models.push(trimmed.to_string());
-                        }
-                    }
-                    if !models.is_empty() {
-                        return Ok(models);
-                    }
-                }
+        let event_type = json_field(&line, "type").unwrap_or_default();
+        if event_type == "error" {
+            if let Some(msg) = json_field(&line, "message") {
+                return Err(msg);
             }
+        } else if event_type == "model_item" {
+            if let Some(text) = json_field(&line, "text") {
+                models.push(text);
+            }
+        } else if event_type == "done" {
+            break;
         }
     }
 
-    Err("no models found in bridge response".to_string())
+    if models.is_empty() {
+        return Err("bridge returned no models".to_string());
+    }
+
+    Ok(models)
 }
 
 fn build_payload(config: &Config, history: &[Message]) -> String {
@@ -537,7 +674,7 @@ fn print_banner(config: &Config) {
         "{}",
         paint(
             config,
-            "╭─ Gemma Glow ───────────────────────────────╮",
+            "╭─ Edge Glow ───────────────────────────────╮",
             "\x1b[38;5;141m"
         )
     );
@@ -570,7 +707,7 @@ fn print_banner(config: &Config) {
     println!(
         "{} commands    {}",
         paint(config, "│", "\x1b[38;5;141m"),
-        paint(config, "/help  /models  /providers  /model  /provider  /exit", "\x1b[38;5;250m")
+        paint(config, "/help  /model  /provider  /exit", "\x1b[38;5;250m")
     );
     println!(
         "{}",
@@ -583,7 +720,7 @@ fn print_banner(config: &Config) {
 }
 
 fn print_help() {
-    println!("Gemma Glow - streamed Google AI Studio / Ollama chat");
+    println!("Edge Glow - streamed Google AI Studio / Ollama chat");
     println!();
     println!("Usage:");
     println!("  cargo run -- [options]");
@@ -610,10 +747,8 @@ fn print_chat_help(config: &Config) {
         paint(config, "╭─ Commands ─────────────────────────────────╮", "\x1b[38;5;141m")
     );
     println!("{} /help              show commands", paint(config, "│", "\x1b[38;5;141m"));
-    println!("{} /models            list available models", paint(config, "│", "\x1b[38;5;141m"));
-    println!("{} /providers         list supported providers", paint(config, "│", "\x1b[38;5;141m"));
-    println!("{} /provider [name]   show/switch provider", paint(config, "│", "\x1b[38;5;141m"));
-    println!("{} /model [name]      show/switch model", paint(config, "│", "\x1b[38;5;141m"));
+    println!("{} /model [name]      list or switch model", paint(config, "│", "\x1b[38;5;141m"));
+    println!("{} /provider [name]   list or switch provider", paint(config, "│", "\x1b[38;5;141m"));
     println!("{} /clear             clear chat memory", paint(config, "│", "\x1b[38;5;141m"));
     println!("{} /exit              quit", paint(config, "│", "\x1b[38;5;141m"));
     println!(
@@ -622,13 +757,35 @@ fn print_chat_help(config: &Config) {
     );
 }
 
-fn print_prompt(config: &Config, label: &str) {
-    let color = if label == "you" {
-        "\x1b[1m\x1b[38;5;82m"
-    } else {
-        "\x1b[1m\x1b[38;5;213m"
-    };
-    print!("\n{} ", paint(config, &format!("{label} ❯"), color));
+fn print_notice(config: &Config, message: &str) {
+    println!(
+        "{} {}",
+        paint(config, "note", "\x1b[1m\x1b[38;5;80m"),
+        message
+    );
+}
+
+fn print_error(config: &Config, message: &str) {
+    eprintln!(
+        "\n{} {}",
+        paint(config, "error", "\x1b[1m\x1b[38;5;196m"),
+        message
+    );
+}
+
+fn run_demo(config: &Config) {
+    let mut thought = StreamRenderer::new(config, StreamKind::Thought);
+    thought.feed("I will keep this concise, structured, and easy to scan.");
+    thought.finish();
+
+    let mut answer = StreamRenderer::new(config, StreamKind::Answer);
+    answer.feed("## Clean CLI Output\n\n");
+    answer.feed("Here is how streamed Markdown now looks inside Edge Glow:\n\n");
+    answer.feed("1. **Readable sections:** answers live inside a bordered response block.\n");
+    answer.feed("2. **Cleaner Markdown:** bold markers disappear and styling is applied.\n");
+    answer.feed("* **Compact bullets:** raw `*` list markers become terminal bullets.\n\n");
+    answer.feed("Use `/clear` when you want a fresh chat, and `/exit` when you are done.");
+    answer.finish();
 }
 
 fn paint(config: &Config, text: &str, color: &str) -> String {
@@ -643,10 +800,17 @@ impl<'a> StreamRenderer<'a> {
     fn new(config: &'a Config, kind: StreamKind) -> Self {
         match kind {
             StreamKind::Answer => {
-                println!(
-                    "{}",
-                    paint(config, "╭─ Gemma ────────────────────────────────────╮", "\x1b[38;5;213m")
-                );
+                let label = format!("╭─ Glow({}) ", config.model);
+                let mut header = label;
+                let total_width = 46;
+                let current_width = header.chars().count();
+                if current_width < total_width - 1 {
+                    for _ in 0..(total_width - 1 - current_width) {
+                        header.push('─');
+                    }
+                }
+                header.push('╮');
+                println!("{}", paint(config, &header, "\x1b[38;5;213m"));
             }
             StreamKind::Thought => {
                 println!(
@@ -877,37 +1041,6 @@ impl<'a> StreamRenderer<'a> {
             }
         }
     }
-}
-
-fn print_notice(config: &Config, message: &str) {
-    println!(
-        "{} {}",
-        paint(config, "note", "\x1b[1m\x1b[38;5;80m"),
-        message
-    );
-}
-
-fn print_error(config: &Config, message: &str) {
-    eprintln!(
-        "\n{} {}",
-        paint(config, "error", "\x1b[1m\x1b[38;5;196m"),
-        message
-    );
-}
-
-fn run_demo(config: &Config) {
-    let mut thought = StreamRenderer::new(config, StreamKind::Thought);
-    thought.feed("I will keep this concise, structured, and easy to scan.");
-    thought.finish();
-
-    let mut answer = StreamRenderer::new(config, StreamKind::Answer);
-    answer.feed("## Clean CLI Output\n\n");
-    answer.feed("Here is how streamed Markdown now looks inside Gemma Glow:\n\n");
-    answer.feed("1. **Readable sections:** answers live inside a bordered response block.\n");
-    answer.feed("2. **Cleaner Markdown:** bold markers disappear and styling is applied.\n");
-    answer.feed("* **Compact bullets:** raw `*` list markers become terminal bullets.\n\n");
-    answer.feed("Use `/clear` when you want a fresh chat, and `/exit` when you are done.");
-    answer.finish();
 }
 
 fn json_string(value: &str) -> String {

@@ -1,4 +1,4 @@
-# Gemma Glow
+# Edge Glow
 
 Beautiful Rust CLI for chatting with Google AI Studio and Ollama models, with a tiny Python streaming bridge.
 

@@ -1,0 +1,11 @@
+[
+    {"id": "gemma4:12b", "size": "7.2GB", "params": "12B", "desc": "Google: unified multimodal agent"},
+    {"id": "gemma4:e4b", "size": "2.4GB", "params": "4B", "desc": "Google: agentic edge specialist"},
+    {"id": "gemma3:4b", "size": "2.5GB", "params": "4B", "desc": "Google: native multimodal SLM"},
+    {"id": "llama3.2:1b", "size": "1.3GB", "params": "1.2B", "desc": "Meta: mobile-first SLM"},
+    {"id": "llama3.2:3b", "size": "2.0GB", "params": "3.2B", "desc": "Meta: smart all-rounder"},
+    {"id": "qwen3.6:7b", "size": "4.8GB", "params": "7.6B", "desc": "Alibaba: latest logical master"},
+    {"id": "qwen2.5-coder:7b", "size": "4.7GB", "params": "7.6B", "desc": "Alibaba: elite coding agent"},
+    {"id": "phi4:latest", "size": "9.1GB", "params": "14B", "desc": "Microsoft: SOTA reasoning"},
+    {"id": "phi3.5:latest", "size": "2.2GB", "params": "3.8B", "desc": "Microsoft: 128k context SLM"}
+]

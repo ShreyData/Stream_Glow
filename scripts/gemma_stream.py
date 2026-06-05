@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -12,7 +13,7 @@ DEFAULT_MODEL = "gemma-4-26b-a4b-it"
 DEFAULT_API_VERSION = "v1beta"
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com"
 DEFAULT_SYSTEM_PROMPT = """
-You are Gemma Glow, a friendly, professional terminal assistant.
+You are Edge Glow, a friendly, professional terminal assistant.
 Reply in a clean CLI-friendly format:
 - Start with the direct answer.
 - Use short paragraphs.
@@ -43,18 +44,18 @@ def main() -> int:
         if action == "list_models":
             ollama_url = request.get("ollama_url") or os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434"
             if provider == "ollama":
-                models = list_ollama_models(ollama_url)
+                ensure_ollama_running(ollama_url)
+                list_ollama_models_stream(ollama_url)
             else:
                 api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-                models = list_google_models(api_key)
-            
-            emit("models", models=models)
+                list_google_models_stream(api_key)
             return 0
 
         model = request.get("model") or os.getenv("GEMMA_MODEL") or DEFAULT_MODEL
 
         if provider == "ollama":
             ollama_url = request.get("ollama_url") or os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434"
+            ensure_ollama_running(ollama_url)
             stream_ollama(model, ollama_url, request)
         else:
             api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
@@ -72,60 +73,94 @@ def main() -> int:
         return 1
 
 
-def list_google_models(api_key: str) -> list:
-    if not api_key:
-        return FALLBACK_GOOGLE_MODELS
-    
-    api_version = os.getenv("GEMINI_API_VERSION", DEFAULT_API_VERSION)
-    base_url = os.getenv("GEMINI_API_BASE", DEFAULT_BASE_URL).rstrip("/")
-    url = f"{base_url}/{api_version}/models?key={api_key}"
-
+def ensure_ollama_running(base_url: str) -> None:
+    """Check if Ollama is running, and if not, try to start it."""
     try:
-        with urllib.request.urlopen(url, timeout=10) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            models = []
-            for m in data.get("models", []):
-                if "generateContent" in m.get("supportedGenerationMethods", []):
-                    name = m.get("name", "").split("/")[-1]
-                    models.append(name)
-            return sorted(models) if models else FALLBACK_GOOGLE_MODELS
-    except Exception:
-        return FALLBACK_GOOGLE_MODELS
-
-
-def list_ollama_models(base_url: str) -> list:
-    """Connect with ollama CLI to get models, fallback to REST API."""
-    models = set()
-    
-    # Try CLI first for better metadata
-    try:
-        result = subprocess.run(
-            ["ollama", "list"], 
-            capture_output=True, 
-            text=True, 
-            timeout=5
-        )
-        if result.returncode == 0:
-            lines = result.stdout.strip().split("\n")
-            if len(lines) > 1:
-                for line in lines[1:]:
-                    parts = line.split()
-                    if parts:
-                        models.add(parts[0])
+        urllib.request.urlopen(f"{base_url.rstrip('/')}/api/tags", timeout=1)
+        return
     except Exception:
         pass
 
-    # Fallback/Supplemental: Try REST API
+    # Try to start Ollama
+    try:
+        if sys.platform == "win32":
+            subprocess.Popen(["ollama", "serve"], creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        for _ in range(5):
+            time.sleep(1)
+            try:
+                urllib.request.urlopen(f"{base_url.rstrip('/')}/api/tags", timeout=1)
+                return
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def list_google_models_stream(api_key: str) -> None:
+    models = []
+    if not api_key:
+        models = FALLBACK_GOOGLE_MODELS
+    else:
+        api_version = os.getenv("GEMINI_API_VERSION", DEFAULT_API_VERSION)
+        base_url = os.getenv("GEMINI_API_BASE", DEFAULT_BASE_URL).rstrip("/")
+        url = f"{base_url}/{api_version}/models?key={api_key}"
+
+        try:
+            with urllib.request.urlopen(url, timeout=10) as response:
+                data = json.loads(response.read().decode("utf-8"))
+                for m in data.get("models", []):
+                    if "generateContent" in m.get("supportedGenerationMethods", []):
+                        name = m.get("name", "").split("/")[-1]
+                        models.append(name)
+                if not models: models = FALLBACK_GOOGLE_MODELS
+        except Exception:
+            models = FALLBACK_GOOGLE_MODELS
+
+    for m in sorted(models):
+        emit("model_item", text=m)
+    emit("done")
+
+
+def list_ollama_models_stream(base_url: str) -> None:
+    """Stream model items to avoid truncation and enable discovery."""
+    installed = set()
     try:
         url = f"{base_url.rstrip('/')}/api/tags"
         with urllib.request.urlopen(url, timeout=5) as response:
             data = json.loads(response.read().decode("utf-8"))
             for m in data.get("models", []):
-                models.add(m["name"])
+                installed.add(m["name"])
     except Exception:
         pass
 
-    return sorted(list(models))
+    # Load from config file
+    edge_models = []
+    config_path = "config/models.json"
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r") as f:
+                edge_models = json.load(f)
+        except Exception:
+            pass
+
+    # 1. Emit curated Edge AI models
+    for model in edge_models:
+        is_inst = (model["id"] in installed or f"{model['id']}:latest" in installed)
+        status = "installed" if is_inst else "available"
+        label = f"{model['id']} [{model['params']}] - {model['size']} ({model['desc']}) - {status}"
+        emit("model_item", text=label)
+        
+        if model["id"] in installed: installed.remove(model["id"])
+        if f"{model['id']}:latest" in installed: installed.remove(f"{model['id']}:latest")
+
+    # 2. Emit remaining installed models
+    for inst in sorted(list(installed)):
+        emit("model_item", text=f"{inst} - installed")
+    
+    emit("done")
 
 
 def build_google_payload(request: dict) -> dict:
@@ -238,6 +273,8 @@ def stream_ollama(model: str, base_url: str, request: dict) -> None:
                     continue
                 chunk = json.loads(line)
                 if "error" in chunk:
+                    if "not found" in chunk["error"].lower():
+                        raise RuntimeError(f"Model '{model}' not found. Run '/model {model}' to switch, but you must 'ollama pull {model}' first.")
                     raise RuntimeError(f"Ollama error: {chunk['error']}")
                 
                 content = chunk.get("message", {}).get("content", "")
